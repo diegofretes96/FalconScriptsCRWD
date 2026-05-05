@@ -1,0 +1,839 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  deploy_logscale_collector.sh v5.0
+#  Automated CrowdStrike Falcon LogScale Collector Deployment
+#
+#  Método: Fleet Management API (install-collector.sh)
+#  Fix:    Pre-crea updateServiceInfo.json para evitar error de instalación
+#
+#  Compatible: RHEL/CentOS/Fedora/Rocky/Alma, Ubuntu/Debian, SLES/openSUSE
+#  Uso: sudo bash deploy_logscale_collector.sh
+# ============================================================================
+
+set -euo pipefail
+
+# ── COLORES ─────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ── VARIABLES GLOBALES ──────────────────────────────────────────────────────
+LOG_FILE="/tmp/logscale_deploy_$(date +%Y%m%d_%H%M%S).log"
+DISTRO_FAMILY=""
+PKG_MANAGER=""
+
+# Se detectan dinámicamente
+SERVICE_NAME=""
+CONFIG_DIR=""
+CONFIG_FILE=""
+DATA_DIR=""
+
+# Fleet Management
+FLC_REGION=""
+FLC_BASE_URL=""
+INSTALL_TOKEN=""
+BEARER_TOKEN=""
+
+# Configuración YAML
+SOURCE_TYPE=""
+SOURCE_NAME=""
+SOURCE_BLOCK=""
+SYSLOG_PORT=""
+SYSLOG_MODE=""
+FILE_PATH=""
+SINK_TYPE=""
+HEC_TOKEN=""
+HEC_URL=""
+PROXY_LINE="    proxy: none"
+
+# ── FUNCIONES DE UTILIDAD ───────────────────────────────────────────────────
+
+banner() {
+    clear
+    echo -e "${CYAN}${BOLD}"
+    echo "╔══════════════════════════════════════════════════════════════════╗"
+    echo "║  CrowdStrike Falcon LogScale Collector - Automated Deployer    ║"
+    echo "║  Método: Fleet Management API (install-collector.sh)           ║"
+    echo "║  Compatible: RHEL · Ubuntu · Debian · SLES · Rocky · Alma     ║"
+    echo "╚══════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "  ${DIM}Log: ${LOG_FILE}${NC}"
+    echo ""
+}
+
+log_msg() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" >> "${LOG_FILE}"; }
+info()    { echo -e "  ${GREEN}[✔]${NC} $1"; log_msg "INFO" "$1"; }
+warn()    { echo -e "  ${YELLOW}[!]${NC} $1"; log_msg "WARN" "$1"; }
+error()   { echo -e "  ${RED}[✖]${NC} $1"; log_msg "ERROR" "$1"; }
+step()    { echo -e "\n  ${CYAN}${BOLD}── $1 ──${NC}"; log_msg "STEP" "$1"; }
+prompt()  { echo -en "  ${BOLD}$1${NC}"; }
+separator() { echo -e "  ${DIM}──────────────────────────────────────────────────────${NC}"; }
+
+confirm_continue() {
+    echo ""
+    prompt "¿Deseas continuar? (s/n): "
+    read -r respuesta
+    [[ ! "${respuesta}" =~ ^[sS](i|í)?$ ]] && { warn "Cancelado."; exit 0; }
+}
+
+# ── DETECCIÓN DE SERVICIO Y RUTAS ───────────────────────────────────────────
+
+detect_service_name() {
+    if systemctl list-unit-files "logscale-collector.service" &>/dev/null 2>&1; then
+        SERVICE_NAME="logscale-collector"
+        CONFIG_DIR="/etc/logscale-collector"
+        DATA_DIR="/var/lib/logscale-collector"
+    elif systemctl list-unit-files "humio-log-collector.service" &>/dev/null 2>&1; then
+        SERVICE_NAME="humio-log-collector"
+        CONFIG_DIR="/etc/humio-log-collector"
+        DATA_DIR="/var/lib/humio-log-collector"
+    else
+        # Default para Fleet Management (nuevo naming)
+        SERVICE_NAME="logscale-collector"
+        CONFIG_DIR="/etc/logscale-collector"
+        DATA_DIR="/var/lib/logscale-collector"
+    fi
+    CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+}
+
+# ── VALIDACIONES PREVIAS ────────────────────────────────────────────────────
+
+check_root() {
+    step "Verificando privilegios"
+    if [[ ${EUID} -ne 0 ]]; then
+        error "Ejecuta con: sudo bash $0"
+        exit 1
+    fi
+    info "Ejecutando como root."
+}
+
+detect_distro() {
+    step "Detectando sistema operativo"
+    [[ ! -f /etc/os-release ]] && { error "/etc/os-release no existe."; exit 1; }
+
+    source /etc/os-release
+    local distro_id="${ID,,}"
+    local distro_name="${PRETTY_NAME:-${NAME:-Desconocida}}"
+
+    case "${distro_id}" in
+        rhel|centos|fedora|rocky|almalinux|ol|amzn)
+            DISTRO_FAMILY="rhel"; PKG_MANAGER="rpm" ;;
+        ubuntu|debian|linuxmint|pop)
+            DISTRO_FAMILY="debian"; PKG_MANAGER="dpkg" ;;
+        sles|opensuse*|suse)
+            DISTRO_FAMILY="suse"; PKG_MANAGER="rpm" ;;
+        *)
+            if command -v dnf &>/dev/null || command -v yum &>/dev/null; then
+                DISTRO_FAMILY="rhel"; PKG_MANAGER="rpm"
+            elif command -v apt-get &>/dev/null; then
+                DISTRO_FAMILY="debian"; PKG_MANAGER="dpkg"
+            elif command -v zypper &>/dev/null; then
+                DISTRO_FAMILY="suse"; PKG_MANAGER="rpm"
+            else
+                error "Gestor de paquetes no detectado."; exit 1
+            fi ;;
+    esac
+
+    info "Distribución: ${distro_name}"
+    info "Familia: ${DISTRO_FAMILY} | Arch: $(uname -m)"
+}
+
+check_dependencies() {
+    step "Verificando dependencias"
+    local missing=()
+    for cmd in curl systemctl; do
+        command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
+    done
+    [[ ${#missing[@]} -gt 0 ]] && { error "Faltan: ${missing[*]}"; exit 1; }
+    info "Dependencias OK (curl, systemctl)."
+}
+
+# ── LIMPIEZA DE INSTALACIONES PREVIAS ───────────────────────────────────────
+
+cleanup_previous() {
+    step "Verificando y limpiando instalaciones previas"
+
+    local found_something=false
+
+    # Detener servicios activos
+    for svc in logscale-collector humio-log-collector; do
+        if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+            warn "Servicio ${svc} activo."
+            echo ""
+            prompt "¿Detener ${svc} para reinstalar? (s/n): "
+            read -r resp
+            if [[ "${resp}" =~ ^[sS](i|í)?$ ]]; then
+                systemctl stop "${svc}" 2>/dev/null || true
+                info "${svc} detenido."
+            else
+                warn "Cancelado."; exit 0
+            fi
+            found_something=true
+        fi
+    done
+
+    # Limpiar servicios residuales (como logscale-collector-update.service)
+    for residual_svc in logscale-collector-update logscale-collector humio-log-collector; do
+        local svc_file=""
+        for path in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+            if [[ -f "${path}/${residual_svc}.service" ]]; then
+                svc_file="${path}/${residual_svc}.service"
+            fi
+        done
+
+        if systemctl list-unit-files "${residual_svc}.service" &>/dev/null 2>&1 && \
+           ! systemctl is-active --quiet "${residual_svc}" 2>/dev/null; then
+
+            # Solo limpiar si no hay binario instalado (es un residuo)
+            local has_binary=false
+            for bin in /usr/bin/logscale-collector /usr/bin/humio-log-collector; do
+                [[ -f "${bin}" ]] && has_binary=true
+            done
+
+            if ! ${has_binary}; then
+                warn "Servicio residual detectado: ${residual_svc}.service (sin binario)"
+                systemctl disable "${residual_svc}" 2>/dev/null || true
+                [[ -n "${svc_file}" ]] && rm -f "${svc_file}"
+                found_something=true
+                info "Residual ${residual_svc} limpiado."
+            fi
+        fi
+    done
+
+    # Desinstalar paquetes previos
+    local pkg_found=""
+    case "${PKG_MANAGER}" in
+        rpm)
+            pkg_found=$(rpm -qa 2>/dev/null | grep -i "logscale-collector\|humio-log-collector" | head -1)
+            if [[ -n "${pkg_found}" ]]; then
+                warn "Paquete RPM previo: ${pkg_found}"
+                rpm -e "${pkg_found}" 2>&1 | tee -a "${LOG_FILE}" || true
+                info "Paquete desinstalado."
+                found_something=true
+            fi
+            ;;
+        dpkg)
+            pkg_found=$(dpkg -l 2>/dev/null | grep -i "logscale-collector\|humio-log-collector" | awk '{print $2}' | head -1)
+            if [[ -n "${pkg_found}" ]]; then
+                warn "Paquete DEB previo: ${pkg_found}"
+                dpkg -r "${pkg_found}" 2>&1 | tee -a "${LOG_FILE}" || true
+                info "Paquete desinstalado."
+                found_something=true
+            fi
+            ;;
+    esac
+
+    # Limpiar directorios de config huérfanos (sin binario)
+    for dir in /etc/logscale-collector /etc/humio-log-collector; do
+        if [[ -d "${dir}" ]]; then
+            warn "Directorio huérfano: ${dir}"
+            rm -rf "${dir}"
+            info "Eliminado: ${dir}"
+            found_something=true
+        fi
+    done
+
+    # Limpiar binarios huérfanos
+    for bin in /usr/bin/logscale-collector /usr/bin/humio-log-collector; do
+        if [[ -f "${bin}" ]]; then
+            rm -f "${bin}"
+            info "Binario huérfano eliminado: ${bin}"
+            found_something=true
+        fi
+    done
+
+    # Recargar systemd
+    systemctl daemon-reload
+
+    if ${found_something}; then
+        info "Limpieza completada. Sistema listo para instalación limpia."
+    else
+        info "No se encontró instalación previa."
+    fi
+}
+
+# ── PRE-CREAR ESTRUCTURA PARA FLEET MANAGEMENT ─────────────────────────────
+
+precreate_structure() {
+    step "Pre-creando estructura de directorios"
+
+    # Crear directorio de configuración
+    mkdir -p /etc/logscale-collector
+    info "Creado: /etc/logscale-collector/"
+
+    # Crear directorio de datos
+    mkdir -p /var/lib/logscale-collector
+    info "Creado: /var/lib/logscale-collector/"
+
+    # *** FIX CRÍTICO ***
+    # El install-collector.sh de CrowdStrike busca este archivo ANTES de instalar.
+    # Si no existe, aborta con exit code 1 y no instala el binario.
+    # Lo pre-creamos con la estructura mínima que espera.
+    local service_info="/etc/logscale-collector/updateServiceInfo.json"
+    cat > "${service_info}" <<'EOFJ'
+{
+  "serviceName": "logscale-collector",
+  "serviceUser": "logscale-collector",
+  "serviceUserGroup": "logscale-collector",
+  "binaryPath": "/usr/bin/logscale-collector",
+  "configFile": "/etc/logscale-collector/config.yaml",
+  "dataDirectory": "/var/lib/logscale-collector"
+}
+EOFJ
+    chmod 644 "${service_info}"
+    info "Creado: ${service_info} (fix para Fleet Management installer)"
+}
+
+# ── DESCARGA VÍA FLEET MANAGEMENT API ──────────────────────────────────────
+
+download_collector() {
+    step "Descarga del Collector (Fleet Management API)"
+
+    echo ""
+    echo -e "  ${BOLD}Necesitas 2 datos de tu consola CrowdStrike Falcon:${NC}"
+    echo ""
+    echo -e "  ${CYAN}¿Dónde encontrarlos?${NC}"
+    echo "    1. Consola Falcon → NG-SIEM → Log Management → Log Collector"
+    echo "    2. Clic en: ${BOLD}Add Log Collector${NC}"
+    echo "    3. CrowdStrike muestra un comando curl con los datos."
+    echo ""
+    echo -e "  ${DIM}curl https://flc-api.us-2.crowdstrike.com/.../install-collector.sh \\${NC}"
+    echo -e "  ${DIM}  -d <INSTALL_TOKEN> -H \"Authorization: Bearer <JWT>\" | sudo bash${NC}"
+    echo ""
+    separator
+
+    # ── Región ──
+    echo ""
+    echo -e "  ${CYAN}Paso 1/3 - Región${NC}"
+    echo ""
+    echo "    1) US-1  →  flc-api.us-1.crowdstrike.com"
+    echo "    2) US-2  →  flc-api.us-2.crowdstrike.com"
+    echo "    3) EU-1  →  flc-api.eu-1.crowdstrike.com"
+    echo "    4) GOV-1 →  flc-api.laggar.gcw.crowdstrike.com"
+    echo "    5) Custom"
+    echo ""
+    prompt "Región [2]: "
+    read -r rc
+    rc="${rc:-2}"
+
+    case "${rc}" in
+        1) FLC_REGION="us-1"; FLC_BASE_URL="https://flc-api.us-1.crowdstrike.com" ;;
+        2) FLC_REGION="us-2"; FLC_BASE_URL="https://flc-api.us-2.crowdstrike.com" ;;
+        3) FLC_REGION="eu-1"; FLC_BASE_URL="https://flc-api.eu-1.crowdstrike.com" ;;
+        4) FLC_REGION="gov-1"; FLC_BASE_URL="https://flc-api.laggar.gcw.crowdstrike.com" ;;
+        5) prompt "URL base: "; read -r FLC_BASE_URL; FLC_BASE_URL="${FLC_BASE_URL%/}"; FLC_REGION="custom" ;;
+        *) error "Inválido."; exit 1 ;;
+    esac
+    info "Región: ${FLC_REGION}"
+
+    # ── Install Token ──
+    separator
+    echo ""
+    echo -e "  ${CYAN}Paso 2/3 - Install Token${NC}"
+    echo -e "  ${DIM}Valor después de -d en el comando curl.${NC}"
+    echo ""
+    prompt "Install Token: "
+    read -r INSTALL_TOKEN
+    [[ -z "${INSTALL_TOKEN}" ]] && { error "Obligatorio."; exit 1; }
+
+    # ── Bearer Token ──
+    separator
+    echo ""
+    echo -e "  ${CYAN}Paso 3/3 - Bearer Token (JWT)${NC}"
+    echo -e "  ${DIM}Valor largo después de 'Bearer' (empieza con eyJ...).${NC}"
+    echo ""
+    prompt "Bearer Token: "
+    read -r BEARER_TOKEN
+    [[ -z "${BEARER_TOKEN}" ]] && { error "Obligatorio."; exit 1; }
+    BEARER_TOKEN="${BEARER_TOKEN#Bearer }"
+
+    # ── Resumen ──
+    separator
+    echo ""
+    echo -e "  ${BOLD}Resumen:${NC}"
+    echo "    URL:    ${FLC_BASE_URL}/api/v1/log-collector/install-collector.sh"
+    echo "    Token:  ${INSTALL_TOKEN:0:8}...${INSTALL_TOKEN: -4}"
+    echo "    JWT:    ${BEARER_TOKEN:0:12}...${BEARER_TOKEN: -4}"
+    confirm_continue
+
+    # ── Pre-crear estructura (FIX del error updateServiceInfo.json) ──
+    precreate_structure
+
+    # ── Descargar ──
+    step "Ejecutando instalador oficial de CrowdStrike"
+    info "Descargando install-collector.sh..."
+    echo ""
+    echo "  ════════════════════════════════════════════════════════════════"
+
+    local install_script="/tmp/logscale_install_$$.sh"
+    local http_code
+
+    http_code=$(curl -s -w "%{http_code}" -o "${install_script}" \
+        "${FLC_BASE_URL}/api/v1/log-collector/install-collector.sh" \
+        -d "${INSTALL_TOKEN}" \
+        -H "Authorization: Bearer ${BEARER_TOKEN}" 2>>"${LOG_FILE}") || true
+
+    log_msg "DEBUG" "HTTP: ${http_code}"
+
+    # Validaciones de respuesta
+    if [[ "${http_code}" != "200" ]]; then
+        error "API devolvió HTTP ${http_code}."
+        echo -e "  ${YELLOW}Respuesta:${NC}"
+        head -5 "${install_script}" 2>/dev/null
+        echo ""
+        echo -e "  ${YELLOW}Verifica región, tokens y conectividad.${NC}"
+        rm -f "${install_script}"
+        fallback_local_package
+        return
+    fi
+
+    if [[ ! -s "${install_script}" ]]; then
+        error "Script vacío."
+        rm -f "${install_script}"
+        fallback_local_package
+        return
+    fi
+
+    if head -1 "${install_script}" 2>/dev/null | grep -qi "error\|unauthorized\|forbidden"; then
+        error "API devolvió error:"
+        head -5 "${install_script}"
+        rm -f "${install_script}"
+        fallback_local_package
+        return
+    fi
+
+    # ── Ejecutar ──
+    info "Ejecutando instalación..."
+    echo ""
+
+    local install_exit=0
+    bash "${install_script}" 2>&1 | tee -a "${LOG_FILE}" || install_exit=$?
+
+    echo ""
+    echo "  ════════════════════════════════════════════════════════════════"
+    rm -f "${install_script}"
+
+    if [[ ${install_exit} -ne 0 ]]; then
+        warn "Instalador retornó código ${install_exit}."
+        echo ""
+
+        # Verificar si a pesar del error el binario sí se instaló
+        local bin_installed=false
+        for bin in /usr/bin/logscale-collector /usr/bin/humio-log-collector; do
+            if [[ -f "${bin}" ]]; then
+                bin_installed=true
+                info "Binario encontrado: ${bin} (instalación exitosa a pesar del código de salida)"
+                break
+            fi
+        done
+
+        if ! ${bin_installed}; then
+            error "El binario NO se instaló."
+            echo ""
+            echo -e "  ${YELLOW}El instalador de CrowdStrike falló completamente.${NC}"
+            echo -e "  ${YELLOW}Opciones:${NC}"
+            echo "    1. Verifica que los tokens no hayan expirado"
+            echo "    2. Regenera el comando curl desde la consola Falcon"
+            echo "    3. Usa un paquete .rpm/.deb descargado manualmente"
+            echo ""
+            fallback_local_package
+            return
+        fi
+    else
+        info "Instalador ejecutado exitosamente."
+    fi
+
+    # Re-detectar servicio y rutas
+    step "Verificando instalación"
+    detect_service_name
+
+    # Mostrar versión
+    local bin_path=""
+    for p in /usr/bin/logscale-collector /usr/bin/humio-log-collector; do
+        [[ -f "${p}" ]] && { bin_path="${p}"; break; }
+    done
+
+    if [[ -n "${bin_path}" ]]; then
+        info "Binario: ${bin_path}"
+        local ver
+        ver=$("${bin_path}" --version 2>/dev/null || echo "N/A")
+        info "Versión: ${ver}"
+    fi
+
+    mkdir -p "${DATA_DIR}"
+}
+
+fallback_local_package() {
+    echo -e "  ${CYAN}${BOLD}MODO ALTERNATIVO: Paquete local${NC}"
+    echo ""
+    prompt "¿Tienes un paquete .rpm/.deb? (s/n): "
+    read -r hl
+    [[ ! "${hl}" =~ ^[sS](i|í)?$ ]] && { error "No se puede continuar."; exit 1; }
+
+    prompt "Ruta al archivo: "
+    read -r lp
+    [[ ! -f "${lp}" ]] && { error "No encontrado: ${lp}"; exit 1; }
+
+    step "Instalando: $(basename "${lp}")"
+    case "${PKG_MANAGER}" in
+        rpm)  rpm -ivh --replacepkgs "${lp}" 2>&1 | tee -a "${LOG_FILE}" ;;
+        dpkg) dpkg -i "${lp}" 2>&1 | tee -a "${LOG_FILE}" || true
+              apt-get install -f -y 2>&1 | tee -a "${LOG_FILE}" || true ;;
+    esac
+    info "Paquete instalado."
+    detect_service_name
+}
+
+# ── CONFIGURACIÓN INTERACTIVA ───────────────────────────────────────────────
+
+configure_collector() {
+    step "Configuración interactiva del config.yaml"
+    echo ""
+    echo -e "  ${BOLD}Archivo: ${CONFIG_FILE}${NC}"
+    echo ""
+
+    # SOURCE
+    echo -e "  ${CYAN}━━━ SOURCE (origen de datos) ━━━${NC}"
+    echo ""
+    echo "    1) syslog UDP    (FortiGate, switches, APs - más común)"
+    echo "    2) syslog TCP"
+    echo "    3) syslog TLS"
+    echo "    4) file (archivos locales)"
+    echo ""
+    prompt "Tipo [1]: "
+    read -r sc
+    sc="${sc:-1}"
+
+    case "${sc}" in
+        1) configure_source_syslog "udp" ;;
+        2) configure_source_syslog "tcp" ;;
+        3) configure_source_syslog_tls ;;
+        4) configure_source_file ;;
+        *) error "Inválido."; exit 1 ;;
+    esac
+
+    # SINK
+    configure_sink
+
+    # ESCRIBIR
+    write_config
+}
+
+configure_source_syslog() {
+    local mode="$1"
+    SOURCE_TYPE="syslog"; SYSLOG_MODE="${mode}"
+
+    echo ""
+    echo -e "  ${YELLOW}⚠  Puertos < 1024 requieren privilegios especiales.${NC}"
+    echo -e "  ${YELLOW}   Recomendados: 1514, 5514, 10514${NC}"
+    echo ""
+    prompt "Puerto ${mode^^} [1514]: "
+    read -r SYSLOG_PORT
+    SYSLOG_PORT="${SYSLOG_PORT:-1514}"
+    validate_port
+
+    SOURCE_NAME="syslog_${mode}_${SYSLOG_PORT}"
+    SOURCE_BLOCK="  ${SOURCE_NAME}:
+    type: syslog
+    mode: ${mode}
+    port: ${SYSLOG_PORT}
+    sink: ngsiem"
+    info "Source: syslog ${mode^^} :${SYSLOG_PORT}"
+}
+
+configure_source_syslog_tls() {
+    SOURCE_TYPE="syslog_tls"
+    prompt "Puerto TLS [6514]: "
+    read -r SYSLOG_PORT
+    SYSLOG_PORT="${SYSLOG_PORT:-6514}"
+    validate_port
+
+    echo ""
+    prompt "Certificado (.pem/.crt): "
+    read -r tls_cert
+    prompt "Llave privada (.key): "
+    read -r tls_key
+
+    SYSLOG_MODE="tcp"
+    SOURCE_NAME="syslog_tls_${SYSLOG_PORT}"
+    SOURCE_BLOCK="  ${SOURCE_NAME}:
+    type: syslog-via-tls
+    port: ${SYSLOG_PORT}
+    certFile: ${tls_cert}
+    keyFile: ${tls_key}
+    sink: ngsiem"
+    info "Source: syslog TLS :${SYSLOG_PORT}"
+}
+
+configure_source_file() {
+    SOURCE_TYPE="file"
+    echo ""
+    prompt "Ruta del archivo (ej: /var/log/syslog): "
+    read -r FILE_PATH
+    [[ -z "${FILE_PATH}" ]] && { error "Ruta obligatoria."; exit 1; }
+
+    prompt "Nombre del source [file_source]: "
+    read -r SOURCE_NAME
+    SOURCE_NAME="${SOURCE_NAME:-file_source}"
+    SOURCE_NAME=$(echo "${SOURCE_NAME}" | tr -cd '[:alnum:]_')
+
+    SOURCE_BLOCK="  ${SOURCE_NAME}:
+    type: file
+    include: ${FILE_PATH}
+    sink: ngsiem"
+    info "Source: file → ${FILE_PATH}"
+}
+
+validate_port() {
+    if ! [[ "${SYSLOG_PORT}" =~ ^[0-9]+$ ]] || [[ "${SYSLOG_PORT}" -lt 1 || "${SYSLOG_PORT}" -gt 65535 ]]; then
+        error "Puerto inválido."; exit 1
+    fi
+    if [[ "${SYSLOG_PORT}" -lt 1024 ]]; then
+        warn "Puerto ${SYSLOG_PORT} < 1024 (privilegiado)."
+        echo -e "  ${YELLOW}Solución: setcap 'cap_net_bind_service=+ep' \$(which ${SERVICE_NAME:-logscale-collector})${NC}"
+        echo ""
+        prompt "¿Cambiar puerto? (s/n) [s]: "
+        read -r cp
+        cp="${cp:-s}"
+        if [[ "${cp}" =~ ^[sS](i|í)?$ ]]; then
+            prompt "Nuevo puerto [1514]: "
+            read -r SYSLOG_PORT
+            SYSLOG_PORT="${SYSLOG_PORT:-1514}"
+        fi
+    fi
+}
+
+configure_sink() {
+    echo ""
+    echo -e "  ${CYAN}━━━ SINK (destino) ━━━${NC}"
+    echo ""
+    echo "    1) hec   (CrowdStrike NG-SIEM)"
+    echo "    2) humio (LogScale directo)"
+    echo ""
+    prompt "Tipo [1]: "
+    read -r sk
+    sk="${sk:-1}"
+    SINK_TYPE="hec"
+    [[ "${sk}" == "2" ]] && SINK_TYPE="humio"
+
+    echo ""
+    echo -e "  ${YELLOW}Ingest Token: NG-SIEM → Settings → Ingest Tokens${NC}"
+    echo ""
+    prompt "Ingest Token: "
+    read -r HEC_TOKEN
+    [[ -z "${HEC_TOKEN}" ]] && { error "Obligatorio."; exit 1; }
+
+    echo ""
+    if [[ "${SINK_TYPE}" == "hec" ]]; then
+        echo "  Región de ingesta:"
+        echo "    1) US-1     2) US-2     3) EU-1     4) GOV-1     5) Custom"
+        echo ""
+
+        local dr="2"
+        case "${FLC_REGION}" in
+            us-1) dr="1" ;; us-2) dr="2" ;; eu-1) dr="3" ;; gov-1) dr="4" ;;
+        esac
+
+        prompt "Región [${dr}]: "
+        read -r rr
+        rr="${rr:-${dr}}"
+
+        local hb=""
+        case "${rr}" in
+            1) hb="ingest.us-1.crowdstrike.com" ;;
+            2) hb="ingest.us-2.crowdstrike.com" ;;
+            3) hb="ingest.eu-1.crowdstrike.com" ;;
+            4) hb="ingest.laggar.gcw.crowdstrike.com" ;;
+            5) prompt "URL completa: "; read -r HEC_URL ;;
+            *) error "Inválido."; exit 1 ;;
+        esac
+
+        if [[ -z "${HEC_URL}" ]]; then
+            echo ""
+            echo -e "  ${YELLOW}Path del HEC (Settings → Ingest Tokens → HEC URL):${NC}"
+            echo -e "  ${DIM}Ej: /api/ingest/hec/3aada115.../v1/services/collector${NC}"
+            echo ""
+            prompt "Path: "
+            read -r hp
+            hp="${hp#/}"
+            HEC_URL="https://${hb}/${hp}"
+        fi
+    else
+        prompt "URL de LogScale: "
+        read -r HEC_URL
+    fi
+
+    echo ""
+    prompt "¿Usa proxy? (s/n) [n]: "
+    read -r up
+    up="${up:-n}"
+    PROXY_LINE="    proxy: none"
+    if [[ "${up}" =~ ^[sS](i|í)?$ ]]; then
+        prompt "URL del proxy: "
+        read -r pu
+        PROXY_LINE="    proxy: ${pu}"
+    fi
+    info "Sink: ${SINK_TYPE} → ${HEC_URL}"
+}
+
+write_config() {
+    step "Resumen"
+    echo ""
+    echo -e "  ${BOLD}SOURCE:${NC}  ${SOURCE_NAME} (${SOURCE_TYPE})"
+    [[ "${SOURCE_TYPE}" != "file" ]] && echo "           Puerto: ${SYSLOG_PORT}/${SYSLOG_MODE^^}"
+    [[ "${SOURCE_TYPE}" == "file" ]] && echo "           Archivo: ${FILE_PATH}"
+    echo -e "  ${BOLD}SINK:${NC}    ${SINK_TYPE} → ${HEC_URL}"
+    echo -e "  ${BOLD}CONFIG:${NC}  ${CONFIG_FILE}"
+    confirm_continue
+
+    step "Generando ${CONFIG_FILE}"
+
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        cp "${CONFIG_FILE}" "${CONFIG_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+        info "Backup creado."
+    fi
+
+    mkdir -p "${CONFIG_DIR}"
+
+    cat > "${CONFIG_FILE}" <<EOF
+# ============================================================================
+# CrowdStrike Falcon LogScale Collector - config.yaml
+# Generado: $(date '+%Y-%m-%d %H:%M:%S')
+# Servicio: ${SERVICE_NAME}
+# ============================================================================
+
+dataDirectory: ${DATA_DIR}
+
+sources:
+${SOURCE_BLOCK}
+
+sinks:
+  ngsiem:
+    type: ${SINK_TYPE}
+${PROXY_LINE}
+    token: ${HEC_TOKEN}
+    url: ${HEC_URL}
+EOF
+
+    chmod 640 "${CONFIG_FILE}"
+    chown logscale-collector:logscale-collector "${CONFIG_FILE}"
+    chown -R logscale-collector:logscale-collector "${DATA_DIR}"
+    info "${CONFIG_FILE} generado (permisos 600)."
+}
+
+# ── FIREWALL ────────────────────────────────────────────────────────────────
+
+configure_firewall() {
+    step "Firewall"
+    [[ "${SOURCE_TYPE}" == "file" ]] && { info "No requiere puerto."; return; }
+
+    local proto="${SYSLOG_MODE:-udp}"
+    echo ""
+    prompt "¿Abrir ${SYSLOG_PORT}/${proto} en firewall? (s/n) [s]: "
+    read -r fw
+    fw="${fw:-s}"
+    [[ ! "${fw}" =~ ^[sS](i|í)?$ ]] && { warn "No abierto."; return; }
+
+    if command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --permanent --add-port="${SYSLOG_PORT}/${proto}" 2>&1 | tee -a "${LOG_FILE}"
+        firewall-cmd --reload 2>&1 | tee -a "${LOG_FILE}"
+        info "firewalld: ${SYSLOG_PORT}/${proto} abierto."
+    elif command -v ufw &>/dev/null; then
+        ufw allow "${SYSLOG_PORT}/${proto}" 2>&1 | tee -a "${LOG_FILE}"
+        info "ufw: ${SYSLOG_PORT}/${proto} abierto."
+    elif command -v iptables &>/dev/null; then
+        iptables -A INPUT -p "${proto}" --dport "${SYSLOG_PORT}" -j ACCEPT 2>&1 | tee -a "${LOG_FILE}"
+        info "iptables: regla agregada."
+    else
+        warn "Sin firewall gestionable."
+    fi
+}
+
+# ── SERVICIO ────────────────────────────────────────────────────────────────
+
+start_service() {
+    step "Iniciando ${SERVICE_NAME}"
+
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}" 2>&1 | tee -a "${LOG_FILE}"
+    info "Habilitado en boot."
+
+    systemctl restart "${SERVICE_NAME}" 2>&1 | tee -a "${LOG_FILE}"
+    sleep 3
+
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        info "${SERVICE_NAME} → ACTIVO (running)"
+    else
+        error "${SERVICE_NAME} NO arrancó."
+        echo ""
+        journalctl -u "${SERVICE_NAME}" --no-pager -n 20 2>/dev/null || true
+        echo ""
+        if [[ -n "${SYSLOG_PORT}" && "${SYSLOG_PORT}" -lt 1024 ]] 2>/dev/null; then
+            echo -e "  ${RED}→ Puerto ${SYSLOG_PORT} < 1024. Cambia o usa setcap.${NC}"
+        fi
+        exit 1
+    fi
+}
+
+# ── RESUMEN ─────────────────────────────────────────────────────────────────
+
+post_install_summary() {
+    local status pid
+    status=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo "inactive")
+    pid=$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || echo "N/A")
+
+    echo ""
+    echo ""
+    echo -e "  ${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${GREEN}${BOLD}║          ✔  DESPLIEGUE COMPLETADO EXITOSAMENTE              ║${NC}"
+    echo -e "  ${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BOLD}Servicio:${NC}   ${GREEN}${status}${NC} (${SERVICE_NAME}, PID: ${pid})"
+    echo -e "  ${BOLD}Config:${NC}     ${CONFIG_FILE}"
+    echo -e "  ${BOLD}Data:${NC}       ${DATA_DIR}"
+    echo -e "  ${BOLD}Log:${NC}        ${LOG_FILE}"
+    echo ""
+    echo -e "  ${CYAN}${BOLD}Comandos:${NC}"
+    echo "    systemctl status ${SERVICE_NAME}"
+    echo "    systemctl restart ${SERVICE_NAME}"
+    echo "    journalctl -u ${SERVICE_NAME} -f"
+    echo ""
+    [[ "${SOURCE_TYPE}" != "file" ]] && \
+        echo -e "  ${CYAN}${BOLD}Siguiente:${NC} Apunta tu dispositivo al puerto ${SYSLOG_PORT}/${SYSLOG_MODE^^}"
+    echo ""
+    echo -e "  ${CYAN}${BOLD}Verificar ingesta:${NC}"
+    echo "    #type=syslog | head(10)"
+    echo ""
+}
+
+# ── MAIN ────────────────────────────────────────────────────────────────────
+
+main() {
+    banner
+    check_root
+    detect_distro
+    check_dependencies
+    cleanup_previous
+
+    echo ""
+    echo -e "  ${BOLD}Este script realizará:${NC}"
+    echo "    1. Limpiar instalaciones previas/residuales"
+    echo "    2. Pre-crear estructura (fix updateServiceInfo.json)"
+    echo "    3. Descargar collector vía Fleet Management API"
+    echo "    4. Configurar config.yaml interactivamente"
+    echo "    5. Abrir puerto en firewall (si aplica)"
+    echo "    6. Habilitar e iniciar el servicio"
+    confirm_continue
+
+    download_collector
+    configure_collector
+    configure_firewall
+    start_service
+    post_install_summary
+}
+
+main "$@"
